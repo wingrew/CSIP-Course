@@ -1,0 +1,14 @@
+nodes:
+  node1: 64
+  node2: 64
+  node3: 64
+  node0: 64
+
+port: 23456
+cmd_prefix: ''
+debug: 0
+
+
+JOBpickle: /home/nfs/m5c/server.py.configs.yaml.default.pickle
+
+ZZJOBS_INIT: 1

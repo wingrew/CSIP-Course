@@ -1,0 +1,436 @@
+from snakemake.utils import min_version
+from collections import defaultdict
+from pathlib import Path
+
+min_version("8.0")
+configfile: Path(workflow.basedir) / "config.yaml"
+
+BIN = config["path"]
+REF = config["reference"]
+
+MBAM=[str(i) for i in range(config["mbam"])]
+FAST=config["fast"]
+WITH_UMI = config.get("library", "") in ["INLINE", "TAKARAV3"]
+MARKDUP = config.get("markdup", False)
+samples = config["samples"]
+INTERNALDIR = Path("internal_files")
+TEMPDIR = Path("tmp")
+
+if os.environ.get("TMPDIR") is None:
+    os.environ["TMPDIR"] = str(TEMPDIR)
+
+envvars:
+    "TMPDIR",
+
+rule all:
+    input:
+        expand("output/{sample}.filtered.tsv", sample=samples),
+        expand("report_reads/mapped/{sample}.mRNA.genome.mapped.sorted.bam.tsv", sample=samples),
+        expand(INTERNALDIR / "aligned_bam/{sample}_{mbam}.mRNA.genome.mapped.sorted.dedup.bam.bai", sample=samples, mbam=MBAM),
+
+rule split_fastq:
+    input: 
+        "input/{sample}.fastq",
+    output:
+        expand("split/{sample}_{fatai}.fastq", sample="{sample}", fatai=FAST),
+    benchmark:
+        "log/{sample}_split_fastq.txt",
+    threads:
+        1
+    shell:
+        """
+        fastqsplitter -t {threads} -i {input} -o {output[0]} -o {output[1]} -o {output[2]} -o {output[3]}
+        """
+
+rule cutadapt:
+    input:
+        "split/{sample}_{fatai}.fastq",
+    output:
+        fastq_cut=temp(TEMPDIR / "cut_adapter/{sample}_{fatai}.fastq_cut"),
+        fastq_tooshort=INTERNALDIR / "discarded_reads/{sample}_{fatai}.fastq_tooshort",
+        fastq_untrimmed=INTERNALDIR / "discarded_reads/{sample}_{fatai}.fastq_untrimmed",
+    params:
+        library="INLINE"
+    benchmark:
+        "log/{sample}_{fatai}_cutseq.txt",
+    threads: 20
+    shell:
+        """
+        cutseq {input} -t {threads} -A {params.library} -m 20 --trim-polyA --ensure-inline-barcode -o {output.fastq_cut} -s {output.fastq_tooshort} -u {output.fastq_untrimmed}
+        """
+
+# Mapping (SE mapping mode)
+
+rule hisat2_3n_mapping_ncrna:
+    input:
+        TEMPDIR / "cut_adapter/{sample}_{fatai}.fastq_cut",
+    output:
+        mapped=TEMPDIR / "mapping_ncrna/{sample}_{fatai}.ncrna.mapped.bam",
+        unmapped=TEMPDIR / "mapping_ncrna/{sample}_{fatai}.ncrna.unmapped.bam",
+        summary="report_reads/mapping/{sample}_{fatai}.ncrna.summary",
+    params:
+        index=REF["ncrna"]["hisat3n"],
+    benchmark:
+        "log/{sample}_{fatai}_mapping_ncrna.txt",    
+    threads: 16
+    shell:
+        """
+        {BIN[hisat3n]} --index {params.index} -p {threads} --summary-file {output.summary} --new-summary -q -U {input} --directional-mapping --base-change C,T --pen-noncansplice 20 --mp 4,1 | \
+            {BIN[samtools]} view -@ {threads} -e '!flag.unmap' -O BAM -U {output.unmapped} -o {output.mapped}
+        """
+
+
+rule extract_unmap_bam_internal:
+    input:
+        TEMPDIR / "mapping_ncrna/{sample}_{fatai}.ncrna.unmapped.bam",
+    output:
+        TEMPDIR / "unmapped_internal/{sample}_{fatai}.mRNA.fastq",
+    threads: 16
+    benchmark:
+        "log/{sample}_{fatai}_samtools_fastq.txt",     
+    shell:
+        """
+        {BIN[samtools]} fastq -@ {threads} -O {input} > {output}
+        """
+
+rule hisat2_3n_mapping_dna:
+    input:
+        TEMPDIR / "unmapped_internal/{sample}_{fatai}.mRNA.fastq",
+    output:
+        mapped=TEMPDIR / "mapping_dna/{sample}_{fatai}.mRNA.genome.mapped.bam",
+        unmapped=TEMPDIR / "mapping_dna/{sample}_{fatai}.mRNA.genome.unmapped.bam",
+        summary="report_reads/mapping/{sample}_{fatai}.dna.summary",
+    params:
+        index=REF["dna"]["hisat3n"],
+    benchmark:
+        "log/{sample}_{fatai}_mapping_dna.txt",
+    threads: 16
+    shell:
+        """
+        {BIN[hisat3n]} --index {params.index} -p {threads} --summary-file {output.summary} --new-summary -q -U {input} --directional-mapping --base-change C,T --pen-noncansplice 20 --mp 4,1 | \
+            {BIN[samtools]} view -@ {threads} -e '!flag.unmap' -O BAM -U {output.unmapped} -o {output.mapped}
+        """
+        
+rule merge:
+    input:
+        [
+            TEMPDIR / "mapping_dna/{sample}"f"_{t}.mRNA.genome.mapped.bam"
+            for t in FAST
+        ]
+    output:
+        temp(TEMPDIR / "mapping_dna/{sample}.mRNA.genome.mapped.bam"),
+    benchmark:
+        "log/{sample}_merge.txt",
+    threads:
+        16
+    shell:
+        """
+        samtools merge -@ {threads} {output} {input}
+        """
+
+rule hisat2_3n_sort:
+    input:
+        TEMPDIR / "mapping_dna/{sample}.mRNA.genome.mapped.bam",
+    output:
+        TEMPDIR / "mapping_dna/{sample}.mRNA.genome.mapped.sorted.bam",
+    threads: 16
+    benchmark:
+        "log/{sample}_samtools_sort.txt",
+    shell:
+        """
+        {BIN[samtools]} sort -@ {threads} --write-index -O BAM -o {output} {input}
+        """
+
+rule stat_mapping_number:
+    input:
+        TEMPDIR / "mapping_dna/{sample}.mRNA.genome.mapped.sorted.bam",
+    output:
+        tsv="report_reads/mapped/{sample}.mRNA.genome.mapped.sorted.bam.tsv",
+    threads: 20
+    benchmark:
+        "log/{sample}_samtools_view.txt",
+    shell:
+        """
+        {BIN[samtools]} view -@ {threads} -F 3980 -c {input} >{output.tsv}
+        """
+
+# rule splitbydna:
+#     input:
+#         TEMPDIR / "mapping_dna/{sample}.mRNA.genome.mapped.sorted.bam",
+#     output:
+#         temp(expand(INTERNALDIR / "aligned_bam/{sample}.mRNA.genome.mapped.sorted.bydna_{mbam}.bam", sample="{sample}", mbam=MBAM)),
+#     threads: 4
+    
+#     benchmark:
+#         "log/{sample}_splitbydna.txt",
+#     shell:
+#         """
+
+#         """    
+
+rule dedup_mapping:
+    input:
+        bam=TEMPDIR / "mapping_dna/{sample}.mRNA.genome.mapped.sorted.bam",
+    output:
+        bam=INTERNALDIR / "aligned_bam/{sample}.mRNA.genome.mapped.sorted.dedup.bam",
+        txt="report_reads/dedup/{sample}.mRNA.genome.mapped.sorted.dedup.log",
+    params:
+        tmp=os.environ["TMPDIR"],
+    benchmark:
+        "log/{sample}_java_dup.txt",    
+    threads: 16
+    shell:
+        """
+        java -server -Xms8G -Xmx40G -Xss100M -Djava.io.tmpdir={params.tmp} -jar {BIN[umicollapse]} bam \
+        -t 2 -T {threads} --data naive --merge avgqual --two-pass -i {input.bam} -o {output.bam} >{output.txt}
+        """
+
+
+rule split_bam:
+    input:
+        bam=INTERNALDIR / "aligned_bam/{sample}.mRNA.genome.mapped.sorted.dedup.bam",
+    output:
+        expand(INTERNALDIR / "aligned_bam/{sample}.mRNA.genome.mapped.sorted.dedup_{mbam}.bam", sample="{sample}", mbam=MBAM),
+    threads: 64
+    params:
+        num=config["mbam"]
+    benchmark:
+        "log/{sample}_split_bam.txt",
+    shell:
+        """
+        {BIN[splitbam]} {input} -o {INTERNALDIR}/"aligned_bam/{wildcards.sample}.mRNA.genome.mapped.sorted.dedup" -@ {threads} -n {params.num} -r $(samtools idxstats {input} | awk '{{s+=$3}} END {{print s}}')
+        """ 
+
+rule dedup_index:
+    input:
+        bam=INTERNALDIR / "aligned_bam/{sample}.mRNA.genome.mapped.sorted.dedup_{mbam}.bam",
+    output:
+        bai=INTERNALDIR / "aligned_bam/{sample}_{mbam}.mRNA.genome.mapped.sorted.dedup.bam.bai",
+    threads: 4
+    benchmark:
+        "log/{sample}_{mbam}_dup_index.txt", 
+    shell:
+        """
+        {BIN[samtools]} index -@ {threads} {input} -o {output.bai}
+        """
+
+
+# call mutation
+rule hisat2_3n_calling_unfiltered_unique:
+    input:
+        INTERNALDIR / "aligned_bam/{sample}.mRNA.genome.mapped.sorted.dedup_{mbam}.bam",
+    output:
+        TEMPDIR / "unfiltered_unique/{sample}_{mbam}_unfiltered_unique.tsv.gz",
+    params:
+        fa=REF["dna"]["fa"],
+    threads: 3
+    benchmark:
+        "log/{sample}_{mbam}_unfiltered_unique.txt", 
+    shell:
+        """
+        {BIN[samtools]} view -e "rlen<100000" -h {input} | {BIN[hisat3ntable]} -p 1 -u --alignments - --ref {params.fa} --output-name /dev/stdout --base-change C,T | tail -n +7 | cut -f 1,2,3,5,7 | gzip -c > {output}
+        """
+
+
+rule hisat2_3n_calling_unfiltered_multi:
+    input:
+        INTERNALDIR / "aligned_bam/{sample}.mRNA.genome.mapped.sorted.dedup_{mbam}.bam",
+    output:
+        TEMPDIR / "unfiltered_multi/{sample}_{mbam}_unfiltered_multi.tsv.gz",
+    params:
+        fa=REF["dna"]["fa"],
+    threads: 3
+    benchmark:
+        "log/{sample}_{mbam}_unfiltered_multi.txt", 
+    shell:
+        """
+        {BIN[samtools]} view -e "rlen<100000" -h {input} | {BIN[hisat3ntable]} -p 1 -m --alignments - --ref {params.fa} --output-name /dev/stdout --base-change C,T | tail -n +7 | cut -f 1,2,3,5,7 | gzip -c > {output}
+        """
+
+
+rule hisat2_3n_filtering:
+    input:
+        INTERNALDIR / "aligned_bam/{sample}.mRNA.genome.mapped.sorted.dedup_{mbam}.bam",
+    output:
+        TEMPDIR / "hisat_converted/{sample}.mRNA.genome.mapped.sorted.dedup.filtered_{mbam}.bam",
+    threads: 4
+    benchmark:
+        "log/{sample}_{mbam}_untofiltered.txt",     
+    shell:
+        """
+        {BIN[samtools]} view -@ {threads} -e "[XM] * 20 <= (qlen-sclen) && [Zf] <= 3 && 3 * [Zf] <= [Zf] + [Yf]" {input} -O BAM -o {output}
+        """
+
+
+rule hisat2_3n_calling_filtered_unqiue:
+    input:
+        TEMPDIR / "hisat_converted/{sample}.mRNA.genome.mapped.sorted.dedup.filtered_{mbam}.bam",
+    output:
+        TEMPDIR / "filtered_unique/{sample}_{mbam}_filtered_unique.tsv.gz",
+    params:
+        fa=REF["dna"]["fa"],
+    threads: 3
+    benchmark:
+        "log/{sample}_{mbam}_filtered_unique.txt",    
+    shell:
+        """
+        {BIN[samtools]} view -e "rlen<100000" -h {input} | {BIN[hisat3ntable]} -p 1 -u --alignments - --ref {params.fa} --output-name /dev/stdout --base-change C,T | tail -n +7 | cut -f 1,2,3,5,7 | gzip -c > {output}
+        """
+
+
+rule hisat2_3n_calling_filtered_multi:
+    input:
+        TEMPDIR / "hisat_converted/{sample}.mRNA.genome.mapped.sorted.dedup.filtered_{mbam}.bam",
+    output:
+        TEMPDIR / "filtered_multi/{sample}_{mbam}_filtered_multi.tsv.gz",
+    params:
+        fa=REF["dna"]["fa"],
+    threads: 3
+    benchmark:
+        "log/{sample}_{mbam}_filtered_multi.txt", 
+    shell:
+        """
+        {BIN[samtools]} view -e "rlen<100000" -h {input} | {BIN[hisat3ntable]} -p 1 -m --alignments - --ref {params.fa} --output-name /dev/stdout --base-change C,T | tail -n +7 | cut -f 1,2,3,5,7 | gzip -c > {output}
+        """
+
+rule merge_tsv_un_un:
+    input:
+        files = expand(TEMPDIR / "unfiltered_unique/{sample}_{mbam}_unfiltered_unique.tsv.gz", sample="{sample}", mbam=MBAM)
+    output:
+        INTERNALDIR / "unfiltered_unique/{sample}_unfiltered_unique.tsv.gz",
+    shell:
+        """
+        zcat "{input.files[0]}" > {output}.try  
+
+        for file in {input.files}; do
+            if [ "$file" != "{input.files[0]}" ]; then
+                echo "" >> {output}.try
+                zcat $file | tail -n +2 >> {output}.try
+            fi
+        done
+
+        gzip -c {output}.try > {output}
+        """
+
+rule merge_tsv_un_mu:
+    input:
+        files = expand(TEMPDIR / "unfiltered_multi/{sample}_{mbam}_unfiltered_multi.tsv.gz", sample="{sample}", mbam=MBAM)
+    output:
+        INTERNALDIR / "unfiltered_multi/{sample}_unfiltered_multi.tsv.gz",
+    shell:
+        """
+        zcat "{input.files[0]}" > {output}.try  
+
+        for file in {input.files}; do
+            if [ "$file" != "{input.files[0]}" ]; then
+                echo "" >> {output}.try
+                zcat $file | tail -n +2 >> {output}.try
+            fi
+        done
+
+        gzip -c {output}.try > {output}
+        """
+
+rule merge_tsv_fi_un:
+    input:
+        files = expand(TEMPDIR / "filtered_unique/{sample}_{mbam}_filtered_unique.tsv.gz", sample="{sample}", mbam=MBAM)
+    output:
+        INTERNALDIR / "filtered_unique/{sample}_filtered_unique.tsv.gz",
+    shell:
+        """
+        zcat "{input.files[0]}" > {output}.try  
+
+        for file in {input.files}; do
+            if [ "$file" != "{input.files[0]}" ]; then
+                echo "" >> {output}.try
+                zcat $file | tail -n +2 >> {output}.try
+            fi
+        done
+
+        gzip -c {output}.try > {output}
+        """
+
+rule merge_tsv_fi_mu:
+    input:
+        files = expand(TEMPDIR / "filtered_multi/{sample}_{mbam}_filtered_multi.tsv.gz", sample="{sample}", mbam=MBAM)
+    output:
+        INTERNALDIR / "filtered_multi/{sample}_filtered_multi.tsv.gz",
+    shell:
+        """
+        zcat "{input.files[0]}" > {output}.try  
+
+        for file in {input.files}; do
+            if [ "$file" != "{input.files[0]}" ]; then
+                echo "" >> {output}.try
+                zcat $file | tail -n +2 >> {output}.try
+            fi
+        done
+
+        gzip -c {output}.try > {output}
+        """
+
+rule join_pileup:
+    input:
+        lambda wildcards: [
+            INTERNALDIR / f"{t}/{wildcards.sample}_{t}.tsv.gz"
+            for t in [
+                "unfiltered_unique",
+                "unfiltered_multi",
+                "filtered_unique",
+                "filtered_multi",
+            ]
+
+        ],
+    output:
+        INTERNALDIR / "count_sites/{sample}_genome.arrow",
+    benchmark:
+        "log/{sample}_join.txt",      
+    shell:
+        """
+        {BIN[join_pileup.py]} -i {input} -o {output} -n 1
+        """
+
+
+rule group_pileup:
+    input:
+        lambda wildcards: [
+            INTERNALDIR / f"count_sites/{sample_all}_genome.arrow"
+            for sample_all in samples
+        ],
+    output:
+        INTERNALDIR / "group_sites/WT.arrow",
+    threads: 6
+    benchmark:
+        "log/_group.txt",  
+    shell:
+        """
+        {BIN[group_pileup.py]} -i {input} -o {output}
+        """
+
+
+rule combined_select_sites:
+    input:
+        INTERNALDIR / "group_sites/WT.arrow",
+    output:
+        "detected_sites/prefilter/WT.prefilter.tsv",
+    benchmark:
+        "log/combined.txt",  
+    shell:
+        """
+        {BIN[select_sites.py]} -i {input} -o {output}
+        """
+
+
+rule stat_sample_background:
+    input:
+        site=INTERNALDIR / "count_sites/{sample}_genome.arrow",
+        mask="detected_sites/prefilter/WT.prefilter.tsv",
+    output:
+        background="detected_sites/background/{sample}.bg.tsv",
+        filtered="output/{sample}.filtered.tsv",
+    benchmark:
+        "log/{sample}_filtered.txt",  
+    shell:
+        """
+        {BIN[filter_sites.py]} -i {input.site} -m {input.mask} -b {output.background} -o {output.filtered}
+        """

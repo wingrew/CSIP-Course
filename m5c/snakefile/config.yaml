@@ -1,0 +1,56 @@
+# tools and scripts
+path:
+  samtools: samtools
+  hisat3n: hisat-3n
+  hisat3ntable: hisat-3n-table
+  join_pileup.py: bin/join_pileup.py
+  group_pileup.py: bin/group_pileup.py
+  select_sites.py: bin/select_sites.py
+  filter_sites.py: bin/filter_sites.py
+  umicollapse: ../UMICollapse/umicollapse.jar
+  splitbam: ./splitbam
+
+# global config
+#
+# prepare genes index
+# premap to rRNA, tRNA and other small RNA
+# If study virus, then also premap to virus genome
+# customized_genes:
+#   - a.fa
+#   - b.fa
+library: INLINE
+# makedup: false
+# reference genome and index
+reference:
+  ncrna:
+    fa: ./reference/Homo_sapiens.GRCh38.ncrna.fa
+    hisat3n: ./reference/Homo_sapiens.GRCh38.ncrna.fa
+  dna:
+    fa: ./reference/Homo_sapiens.GRCh38.dna.primary_assembly.fa
+    hisat3n: ./reference/Homo_sapiens.GRCh38.dna.primary_assembly.fa
+
+# Sample name should be indentical and listed in the 2nd level of the yaml file
+# Each sample will be analysis seperately, but
+# samples sharing the same group id will be regared as biological replicates and combined in the comparing step
+# please put samples in ./input
+samples:
+  - SRR23538290
+  - SRR23538291
+  - SRR23538292
+
+# 分裂的bam数量
+mbam: 4
+
+# 分裂的输入文件数量
+fast:
+  - "first"
+  - "second"
+  - "third"
+  - "fourth"
+
+parallel:
+  nodes: 1
+  cores: 64
+  tasks: 3
+
+
